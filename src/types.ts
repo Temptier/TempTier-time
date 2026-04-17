@@ -15,6 +15,12 @@ export interface FirebaseConfig {
   databaseURL: string;
 }
 
+export interface GuildMember {
+  id: string;
+  nickname: string;
+  joinedAt: string;
+}
+
 export interface Guild {
   id: string;
   name: string;
@@ -24,6 +30,8 @@ export interface Guild {
   firebaseConfig?: FirebaseConfig;
   webhookUrl?: string;
   officerIds: string[]; // IDs of users appointed as officers
+  members: GuildMember[]; // Approved members
+  pendingApprovals: GuildMember[]; // Users waiting for approval
   timers?: Timer[];
 }
 
@@ -32,6 +40,7 @@ export interface UserProfile {
   nickname: string;
   role: UserRole;
   guildId?: string;
+  browserNotificationsEnabled?: boolean;
 }
 
 export interface ScheduleEntry {
@@ -47,13 +56,17 @@ export interface Timer {
   group: string;
   status: TimerStatus;
   durationSeconds?: number;
-  autoResetDurationSeconds?: number;
   scheduledTime?: string; // Kept for backward compatibility if needed, but we'll prefer schedules
   schedules?: ScheduleEntry[];
   endTime?: number; 
   lastPausedAt?: number;
   remainingWhenPaused?: number;
   autoReset?: boolean;
+  alertThreshold?: number;
+  autoResetDelay?: number;
+  lastSpawnNotifiedAt?: number;
+  lastResetNotifiedAt?: number;
+  lastThresholdNotifiedAt?: number;
 }
 
 export interface AppState {

@@ -95,12 +95,10 @@ export function pauseTimer(timer: Timer): Timer {
   };
 }
 
-export function resetTimer(timer: Timer, isAutoReset = false): Timer {
+export function resetTimer(timer: Timer): Timer {
   let endTime: number | undefined;
   if (timer.type === 'field') {
-    const duration = (isAutoReset && timer.autoResetDurationSeconds) 
-      ? timer.autoResetDurationSeconds 
-      : (timer.durationSeconds || 0);
+    const duration = timer.durationSeconds || 0;
     endTime = Date.now() + duration * 1000;
   } else if (timer.type === 'schedule') {
     const remaining = calculateRemaining(timer);

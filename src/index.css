@@ -3,17 +3,20 @@
 @theme {
   --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+  --color-gold: #c5a028;
+  --color-navy: #0b192c;
+  --color-navy-dark: #07101d;
 }
 
 @layer base {
   body {
-    @apply bg-[#0f1115] text-gray-100 antialiased;
+    @apply bg-navy-dark text-gray-100 antialiased;
   }
 }
 
 @layer components {
   .glass-card {
-    @apply bg-white/5 border border-white/10 rounded-xl backdrop-blur-sm;
+    @apply bg-white/5 border border-white/5 rounded-xl backdrop-blur-sm;
   }
   
   .btn {
@@ -21,7 +24,7 @@
   }
   
   .btn-primary {
-    @apply bg-indigo-600 text-white hover:bg-indigo-500 shadow-lg shadow-indigo-500/20;
+    @apply bg-gold text-navy-dark hover:bg-[#d4af37] shadow-lg shadow-gold/20;
   }
   
   .btn-secondary {
@@ -29,11 +32,11 @@
   }
 
   .input {
-    @apply w-full bg-white/5 border border-white/10 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 transition-all;
+    @apply w-full bg-white/5 border border-white/5 rounded-lg px-4 py-2 focus:outline-none focus:ring-2 focus:ring-gold/50 transition-all;
   }
 
   .label {
-    @apply block text-xs font-semibold uppercase tracking-wider text-gray-500 mb-1.5;
+    @apply block text-xs font-semibold uppercase tracking-wider text-gray-400/60 mb-1.5;
   }
 }
 
