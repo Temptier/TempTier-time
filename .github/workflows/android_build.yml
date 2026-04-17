@@ -14,7 +14,6 @@ jobs:
         run: |
           touch .env
           echo "VITE_API_KEY=${{ secrets.VITE_API_KEY }}" >> .env
-          # Add any other variables here
           
       - run: npm install
       - run: npm run build
@@ -23,13 +22,22 @@ jobs:
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
-          java-version: '21' # This fixes the error
+          java-version: '21'
 
-      - name: Install Capacitor
+      - name: Install Capacitor & Fix Duplicates
         run: |
           npm install @capacitor/core @capacitor/cli @capacitor/android
           npx cap init "TempTier Time" com.temptier.app --web-dir dist
           npx cap add android
+          
+          # This line fixes the Duplicate Class error by enabling jetifier and resolving conflicts
+          echo "android.useAndroidX=true" >> android/gradle.properties
+          echo "android.enableJetifier=true" >> android/gradle.properties
+          echo "kotlin.code.style=official" >> android/gradle.properties
+          
+          # Force resolution of duplicate Kotlin classes
+          sed -i '/dependencies {/a \    modules { module("org.jetbrains.kotlin:kotlin-stdlib-jdk7") { replacedBy("org.jetbrains.kotlin:kotlin-stdlib") } \n    module("org.jetbrains.kotlin:kotlin-stdlib-jdk8") { replacedBy("org.jetbrains.kotlin:kotlin-stdlib") } }' android/app/build.gradle
+          
           npx cap sync
           
       - name: Build APK
