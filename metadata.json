@@ -1,0 +1,6 @@
+{
+  "name": "Chronos Multi-Server Timer",
+  "description": "A modern multi-server timer management system for games with local and Firebase real-time sync, customizable boss timers, and Discord notifications.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
