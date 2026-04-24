@@ -11,7 +11,7 @@ import {
 } from 'lucide';
 import { AppState, Timer, Guild, TimerType, UserProfile, UserRole } from './types';
 import { StorageManager } from './storage/manager';
-import { calculateRemaining, formatTime, startTimer, pauseTimer, resetTimer } from './timer-logic';
+import { calculateRemaining, formatTime, startTimer, pauseTimer, resetTimer, recoverTimer } from './timer-logic';
 import { 
   sendDiscordNotification, 
   requestNotificationPermission, 
@@ -162,11 +162,12 @@ function loadLocal() {
       // Re-establish sync
       storageManager.setGuild(
         guild, 
-        (timers) => { 
-          state.timers = timers; 
-          checkTimersFinished(timers);
-          render(); 
-        },
+    (timers) => { 
+      const recovered = timers.map(t => recoverTimer(t));
+      state.timers = recovered; 
+      checkTimersFinished(recovered);
+      render(); 
+    },
         (updatedGuild) => {
           // If synced data changes (e.g. officer list updated by leader)
           state.currentGuild = { ...state.currentGuild, ...updatedGuild };
@@ -281,9 +282,14 @@ function proceedToJoin(guild: Guild) {
   state.currentGuild = guild;
   state.view = 'main';
   
-  storageManager.setGuild(
-    guild, 
-    (timers) => { state.timers = timers; checkTimersFinished(timers); render(); },
+    storageManager.setGuild(
+      guild, 
+      (timers) => { 
+        const recovered = timers.map(t => recoverTimer(t));
+        state.timers = recovered; 
+        checkTimersFinished(recovered); 
+        render(); 
+      },
     (updatedGuild) => {
        state.currentGuild = { ...state.currentGuild, ...updatedGuild };
        updateLocalGuildRegistry(updatedGuild);
@@ -341,11 +347,7 @@ function checkTimersFinished(timers: Timer[]) {
             // Shared Notification
             if (timer.lastResetNotifiedAt !== timer.endTime) {
               notifyGuild(state.currentGuild!, `♻️ **${timer.name}** is automatically reset`);
-              const nextTimer = resetTimer(timer);
-              // Clear notification history for new cycle in shared state
-              nextTimer.lastSpawnNotifiedAt = undefined;
-              nextTimer.lastResetNotifiedAt = undefined;
-              nextTimer.lastThresholdNotifiedAt = undefined;
+              const nextTimer = resetTimer(timer, timer.endTime);
               updateTimer(nextTimer);
             }
             // Local Alert

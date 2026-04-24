@@ -95,14 +95,19 @@ export function pauseTimer(timer: Timer): Timer {
   };
 }
 
-export function resetTimer(timer: Timer): Timer {
+export function resetTimer(timer: Timer, baseTime?: number): Timer {
   let endTime: number | undefined;
+  const now = Date.now();
+  
   if (timer.type === 'field') {
     const duration = timer.durationSeconds || 0;
-    endTime = Date.now() + duration * 1000;
+    const delay = (timer.autoResetDelay || 0) * 1000;
+    // Use baseTime (previous endTime) to prevent drift if provided
+    const startFrom = baseTime || now;
+    endTime = startFrom + delay + duration * 1000;
   } else if (timer.type === 'schedule') {
     const remaining = calculateRemaining(timer);
-    endTime = Date.now() + remaining * 1000;
+    endTime = now + remaining * 1000;
   }
 
   return {
@@ -110,6 +115,42 @@ export function resetTimer(timer: Timer): Timer {
     status: 'running',
     endTime,
     lastPausedAt: undefined,
-    remainingWhenPaused: undefined
+    remainingWhenPaused: undefined,
+    // Reset notification flags for the new cycle
+    lastSpawnNotifiedAt: undefined,
+    lastResetNotifiedAt: undefined,
+    lastThresholdNotifiedAt: undefined
   };
+}
+
+export function recoverTimer(timer: Timer): Timer {
+  if (timer.type !== 'field' || !timer.autoReset || timer.status !== 'running' || !timer.endTime) {
+    if (timer.type === 'schedule' && timer.status === 'running') {
+      const remaining = calculateRemaining(timer);
+      if (remaining > 0 && timer.endTime && Math.abs((timer.endTime - Date.now()) / 1000 - remaining) > 60) {
+        return resetTimer(timer);
+      }
+    }
+    return timer;
+  }
+
+  const now = Date.now();
+  const delayMs = (timer.autoResetDelay || 0) * 1000;
+  const cycleMs = (timer.durationSeconds || 0) * 1000 + delayMs;
+
+  if (now > timer.endTime + delayMs) {
+    const timeSinceSpawn = now - timer.endTime;
+    const cyclesPassed = Math.floor(timeSinceSpawn / cycleMs);
+    const newEndTime = timer.endTime + (cyclesPassed + 1) * cycleMs;
+    
+    return {
+      ...timer,
+      endTime: newEndTime,
+      lastSpawnNotifiedAt: undefined,
+      lastResetNotifiedAt: undefined,
+      lastThresholdNotifiedAt: undefined
+    };
+  }
+
+  return timer;
 }
