@@ -80,8 +80,46 @@ export function startTimer(timer: Timer): Timer {
     status: 'running',
     endTime,
     lastPausedAt: undefined,
-    remainingWhenPaused: undefined
+    remainingWhenPaused: undefined,
+    // Reset notification flags for the new cycle
+    lastSpawnNotifiedAt: undefined,
+    lastResetNotifiedAt: undefined,
+    lastThresholdNotifiedAt: undefined
   };
+}
+
+export function recoverTimer(timer: Timer): Timer {
+  if (timer.type !== 'field' || !timer.autoReset || timer.status !== 'running' || !timer.endTime) {
+    if (timer.type === 'schedule' && timer.status === 'running') {
+      // For schedules, we just check if it's stale and recalculate
+      const remaining = calculateRemaining(timer);
+      if (remaining > 0 && timer.endTime && Math.abs((timer.endTime - Date.now()) / 1000 - remaining) > 60) {
+        return resetTimer(timer);
+      }
+    }
+    return timer;
+  }
+
+  const now = Date.now();
+  const delayMs = (timer.autoResetDelay || 0) * 1000;
+  const cycleMs = (timer.durationSeconds || 0) * 1000 + delayMs;
+
+  // Check if we passed the reset point (endTime + delay)
+  if (now > timer.endTime + delayMs) {
+    const timeSinceSpawn = now - timer.endTime;
+    const cyclesPassed = Math.floor(timeSinceSpawn / cycleMs);
+    const newEndTime = timer.endTime + (cyclesPassed + 1) * cycleMs;
+    
+    return {
+      ...timer,
+      endTime: newEndTime,
+      lastSpawnNotifiedAt: undefined,
+      lastResetNotifiedAt: undefined,
+      lastThresholdNotifiedAt: undefined
+    };
+  }
+
+  return timer;
 }
 
 export function pauseTimer(timer: Timer): Timer {
@@ -123,34 +161,3 @@ export function resetTimer(timer: Timer, baseTime?: number): Timer {
   };
 }
 
-export function recoverTimer(timer: Timer): Timer {
-  if (timer.type !== 'field' || !timer.autoReset || timer.status !== 'running' || !timer.endTime) {
-    if (timer.type === 'schedule' && timer.status === 'running') {
-      const remaining = calculateRemaining(timer);
-      if (remaining > 0 && timer.endTime && Math.abs((timer.endTime - Date.now()) / 1000 - remaining) > 60) {
-        return resetTimer(timer);
-      }
-    }
-    return timer;
-  }
-
-  const now = Date.now();
-  const delayMs = (timer.autoResetDelay || 0) * 1000;
-  const cycleMs = (timer.durationSeconds || 0) * 1000 + delayMs;
-
-  if (now > timer.endTime + delayMs) {
-    const timeSinceSpawn = now - timer.endTime;
-    const cyclesPassed = Math.floor(timeSinceSpawn / cycleMs);
-    const newEndTime = timer.endTime + (cyclesPassed + 1) * cycleMs;
-    
-    return {
-      ...timer,
-      endTime: newEndTime,
-      lastSpawnNotifiedAt: undefined,
-      lastResetNotifiedAt: undefined,
-      lastThresholdNotifiedAt: undefined
-    };
-  }
-
-  return timer;
-}

@@ -9,7 +9,7 @@ import {
   Webhook, RefreshCw, MoreVertical, X, LogOut, Shield, UserCircle, LogIn,
   Users, Key, ShieldCheck, Lock, Unlock, Eye, EyeOff
 } from 'lucide';
-import { AppState, Timer, Guild, TimerType, UserProfile, UserRole } from './types';
+import { AppState, Timer, Guild, GuildMember, TimerType, UserProfile, UserRole } from './types';
 import { StorageManager } from './storage/manager';
 import { calculateRemaining, formatTime, startTimer, pauseTimer, resetTimer, recoverTimer } from './timer-logic';
 import { 
@@ -25,8 +25,8 @@ function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-async function notifyGuild(guild: Guild, message: string) {
-  if (guild.webhookUrl) {
+async function notifyGuild(guild: Guild | null, message: string) {
+  if (guild && guild.webhookUrl) {
     await sendDiscordNotification(guild.webhookUrl, message);
   }
 }
@@ -43,22 +43,55 @@ function notifyLocal(timer: Timer, type: 'threshold' | 'spawn' | 'reset', messag
   if (state.currentUser.browserNotificationsEnabled) {
     const cleanMessage = message.replace(/\*\*/g, '');
     sendBrowserNotification('Chronos Alert', cleanMessage);
+    addNotification(cleanMessage, 'alert');
   }
   
   map.set(timer.id, timer.endTime || 0);
 }
 
+function addNotification(message: string, type: 'info' | 'success' | 'alert' | 'error' = 'info') {
+  const notification: AppNotification = {
+    id: crypto.randomUUID(),
+    message,
+    type,
+    timestamp: Date.now()
+  };
+  state.notifications.push(notification);
+  
+  // Auto-remove notification after 5 seconds
+  setTimeout(() => {
+    state.notifications = state.notifications.filter(n => n.id !== notification.id);
+    render();
+  }, 5000);
+  
+  render();
+}
+
 // --- GLOBAL STATE ---
+let debugLogs: string[] = [];
+function logDebug(msg: string) {
+  const time = new Date().toLocaleTimeString();
+  debugLogs.unshift(`[${time}] ${msg}`);
+  if (debugLogs.length > 50) debugLogs.pop();
+}
+
 let state: AppState = {
   guilds: [],
   currentGuild: null,
   currentUser: {
-    id: crypto.randomUUID(),
+    id: (function() {
+      const saved = localStorage.getItem('chronos_user');
+      if (saved) {
+        try { return JSON.parse(saved).id; } catch (e) {}
+      }
+      return crypto.randomUUID();
+    })(),
     nickname: 'New Explorer',
     role: 'member'
   },
   view: 'landing',
-  timers: []
+  timers: [],
+  notifications: []
 };
 
 let storageManager = new StorageManager();
@@ -147,6 +180,7 @@ function loadLocal() {
       memberPassword: '1234',
       leaderKey: 'demo-leader-key',
       storageType: 'local',
+      public: true,
       officerIds: [],
       members: [],
       pendingApprovals: []
@@ -163,20 +197,22 @@ function loadLocal() {
       storageManager.setGuild(
         guild, 
     (timers) => { 
-      const recovered = timers.map(t => recoverTimer(t));
+      const recovered = (timers || []).map(t => recoverTimer(t));
       state.timers = recovered; 
       checkTimersFinished(recovered);
       render(); 
     },
         (updatedGuild) => {
           // If synced data changes (e.g. officer list updated by leader)
-          state.currentGuild = { ...state.currentGuild, ...updatedGuild };
-          updateLocalGuildRegistry(updatedGuild);
-          updateRoleFromGuild();
-          render();
+          if (state.currentGuild && state.currentGuild.id === updatedGuild.id) {
+            state.currentGuild = { ...state.currentGuild, ...updatedGuild, _unsynced: false };
+            updateLocalGuildRegistry(updatedGuild);
+            updateRoleFromGuild();
+            render();
+          }
         }
       );
-      state.currentGuild = guild;
+      state.currentGuild = { ...guild, _unsynced: true };
       updateRoleFromGuild();
     } else {
       state.view = 'landing';
@@ -203,31 +239,58 @@ function updateRoleFromGuild() {
   const savedKey = localStorage.getItem(`auth_key_${state.currentGuild.id}`);
   const isLeader = savedKey === state.currentGuild.leaderKey;
   
-  // Members check
-  const isMember = (state.currentGuild.members || []).some(m => m.id === state.currentUser.id);
+  const members = state.currentGuild.members || [];
+  const memberObj = members.find(m => m.id === state.currentUser.id);
+  const isOfficer = (state.currentGuild.officerIds || []).includes(state.currentUser.id);
+  const isPending = (state.currentGuild.pendingApprovals || []).some(p => p.id === state.currentUser.id);
+
+  const joiningKey = `joining_${state.currentGuild.id}`;
+  const isStillJoining = localStorage.getItem(joiningKey) === 'true';
+
+  if (isLeader) {
+    state.currentUser.role = 'leader';
+  } else if (isOfficer) {
+    state.currentUser.role = 'officer';
+  } else if (memberObj) {
+    state.currentUser.role = memberObj.role || 'member';
+    console.log(`[RoleSync] User is member. Role: ${state.currentUser.role}`);
+  } else if (isPending) {
+    state.currentUser.role = 'pending';
+    console.log('[RoleSync] User is pending approval');
+  } else if (isStillJoining) {
+    state.currentUser.role = 'member'; // Optimistic while joining
+    console.log('[RoleSync] User is still joining, optimistic member role');
+  } else {
+    state.currentUser.role = 'visitor';
+    console.log('[RoleSync] User is visitor');
+  }
   
-  if (!isLeader && !isMember) {
-     leaveGuild();
-     showAlert("You have been removed from this guild.", "Access Revoked");
-     return;
+  // Safety: If the guild data was just loaded and members is empty, give it a moment to sync.
+  // Actually, a better check: if it's firebase, wait for the first real snapshot.
+  const isFirebaseUnsynced = state.currentGuild.storageType === 'firebase' && (state.currentGuild as any)._unsynced;
+
+  // We only kick if the user is definitely not in the guild and not in the process of joining/syncing
+  if (!isLeader && !memberObj && !isPending && !isFirebaseUnsynced && members.length > 0) {
+     const joiningKey = `joining_${state.currentGuild.id}`;
+     const isStillJoining = localStorage.getItem(joiningKey) === 'true';
+     
+     if (!isStillJoining) {
+       console.log('Access revoked - user not found in members, pending, or leader list');
+       leaveGuild();
+       showAlert("You have been removed from this guild or your access was revoked.", "Access Revoked");
+       return;
+     }
   }
 
-  // Checking role priority
-  if (isLeader) {
-     state.currentUser.role = 'leader';
-     return;
-  }
-  
-  if (state.currentGuild.officerIds.includes(state.currentUser.id)) {
-     state.currentUser.role = 'officer';
-  } else {
-     state.currentUser.role = 'member';
+  // Clear joining flag if we successfully found our member object
+  if (memberObj) {
+     localStorage.removeItem(`joining_${state.currentGuild.id}`);
   }
 }
 
 // --- CORE ACTIONS ---
 
-function joinGuild(guildId: string, password?: string) {
+async function joinGuild(guildId: string, password?: string) {
   const guild = state.guilds.find(g => g.id === guildId);
   if (!guild) return showAlert('Guild not found in your local registry.', 'Connection Error');
 
@@ -241,6 +304,11 @@ function joinGuild(guildId: string, password?: string) {
     return;
   }
 
+  // If it's a Firebase guild and we have it in our registry, 
+  // we might be a member but we haven't synced yet.
+  // However, if the user is explicitly trying to "Join", we should probably 
+  // allow them to proceed through the join flow if they aren't confirmed members.
+  
   const hasPasswordRequired = !!guild.memberPassword;
 
   // 2. Automated password join
@@ -253,9 +321,27 @@ function joinGuild(guildId: string, password?: string) {
     if (guild.memberPassword === password) {
        // Add to members
        const nickname = state.currentUser.nickname;
-       if (!guild.members) guild.members = [];
-       guild.members.push({ id: state.currentUser.id, nickname, joinedAt: new Date().toISOString() });
-       storageManager.saveGuildData(guild);
+       const member: GuildMember = { id: state.currentUser.id, nickname, role: 'member', joinedAt: new Date().toISOString() };
+       
+       console.log('Joining guild with password. Adding member:', member);
+       
+       if (guild.storageType === 'firebase') {
+         localStorage.setItem(`joining_${guild.id}`, 'true');
+         await storageManager.updateGuildPartial(guild.id, {
+           members: StorageManager.arrayUnion(member)
+         }, guild);
+         // Optimistically add to members for current session
+         if (!guild.members) guild.members = [];
+         if (!guild.members.some(m => m.id === member.id)) {
+            guild.members.push(member);
+         }
+       } else {
+         if (!guild.members) guild.members = [];
+         if (!guild.members.some(m => m.id === member.id)) {
+            guild.members.push(member);
+         }
+         storageManager.saveGuildData(guild);
+       }
        proceedToJoin(guild);
     } else {
        return showAlert('Incorrect Guild Password. Please try again.', 'Access Denied');
@@ -263,47 +349,87 @@ function joinGuild(guildId: string, password?: string) {
     return;
   }
 
-  // 3. Manual Approval join
+  // 3. Automated open join for public guilds with no password
+  if (guild.public && !guild.memberPassword) {
+     const nickname = state.currentUser.nickname;
+     const member: GuildMember = { id: state.currentUser.id, nickname, role: 'member', joinedAt: new Date().toISOString() };
+     
+     console.log('Joining public guild (open join). Adding member:', member);
+     
+     if (guild.storageType === 'firebase') {
+       localStorage.setItem(`joining_${guild.id}`, 'true');
+       await storageManager.updateGuildPartial(guild.id, {
+         members: StorageManager.arrayUnion(member)
+       }, guild);
+       if (!guild.members) guild.members = [];
+       if (!guild.members.some(m => m.id === member.id)) {
+          guild.members.push(member);
+       }
+     } else {
+       if (!guild.members) guild.members = [];
+       if (!guild.members.some(m => m.id === member.id)) {
+          guild.members.push(member);
+       }
+       storageManager.saveGuildData(guild);
+     }
+     proceedToJoin(guild);
+     return;
+  }
+
+  // 4. Manual Approval join
   const isPending = guild.pendingApprovals?.some(p => p.id === state.currentUser.id);
-  if (isPending) {
-     showAlert("Your join request is still pending approval from a Leader or Officer.", "Wait for Approval");
+  if (isPending || isMember) {
+     showAlert("You are already a member or have a pending request.", "Join Request Blocked");
      return;
   }
 
   if (!guild.pendingApprovals) guild.pendingApprovals = [];
   const nickname = state.currentUser.nickname;
-  guild.pendingApprovals.push({ id: state.currentUser.id, nickname, joinedAt: new Date().toISOString() });
-  storageManager.saveGuildData(guild);
+  const pending: GuildMember = { id: state.currentUser.id, nickname, role: 'member', joinedAt: new Date().toISOString() };
+  
+  if (guild.storageType === 'firebase') {
+    console.log('Pushing pending approval to firebase for guild', guild.id);
+    storageManager.updateGuildPartial(guild.id, {
+      pendingApprovals: StorageManager.arrayUnion(pending)
+    }, guild);
+  } else {
+    console.log('Adding pending approval to local guild', guild.id);
+    guild.pendingApprovals.push(pending);
+    storageManager.saveGuildData(guild);
+  }
   showAlert("This guild requires manual approval. Your request has been sent to the leaders.", "Request Sent");
   render();
 }
 
 function proceedToJoin(guild: Guild) {
-  state.currentGuild = guild;
+  state.currentGuild = { ...guild, _unsynced: true };
   state.view = 'main';
   
     storageManager.setGuild(
       guild, 
       (timers) => { 
-        const recovered = timers.map(t => recoverTimer(t));
+        const recovered = (timers || []).map(t => recoverTimer(t));
         state.timers = recovered; 
         checkTimersFinished(recovered); 
         render(); 
       },
     (updatedGuild) => {
-       state.currentGuild = { ...state.currentGuild, ...updatedGuild };
-       updateLocalGuildRegistry(updatedGuild);
-       updateRoleFromGuild();
-       render();
+       if (state.currentGuild) {
+         state.currentGuild = { ...state.currentGuild, ...updatedGuild, _unsynced: false };
+         updateLocalGuildRegistry(updatedGuild);
+         updateRoleFromGuild();
+         render();
+       }
     }
   );
-  
-  updateRoleFromGuild();
+
   saveLocal();
+  updateRoleFromGuild();
   render();
 }
 
 function leaveGuild() {
+  storageManager.setGuild(null, () => {}, () => {});
   state.currentGuild = null;
   state.view = 'landing';
   localStorage.removeItem('chronos_active_guild_id');
@@ -378,10 +504,61 @@ function updateTimer(updatedTimer: Timer) {
   if (!state.currentGuild) return;
   const index = state.timers.findIndex(t => t.id === updatedTimer.id);
   if (index !== -1) {
-    const newTimers = [...state.timers];
-    newTimers[index] = updatedTimer;
-    storageManager.saveTimers(state.currentGuild.id, newTimers);
+    const oldTimer = state.timers[index];
+    // Quick check to avoid redundant updates
+    if (oldTimer.status !== updatedTimer.status || 
+        oldTimer.endTime !== updatedTimer.endTime ||
+        oldTimer.lastThresholdNotifiedAt !== updatedTimer.lastThresholdNotifiedAt ||
+        oldTimer.lastSpawnNotifiedAt !== updatedTimer.lastSpawnNotifiedAt ||
+        oldTimer.lastResetNotifiedAt !== updatedTimer.lastResetNotifiedAt) {
+      const newTimers = [...state.timers];
+      newTimers[index] = updatedTimer;
+      storageManager.saveTimers(state.currentGuild.id, newTimers);
+    }
   }
+}
+
+function showNotificationsModal() {
+  const content = document.createElement('div');
+  content.className = 'p-6 space-y-4';
+  
+  if (state.notifications.length === 0) {
+    content.innerHTML = '<p class="text-center text-gray-500">No new notifications.</p>';
+  } else {
+    content.innerHTML = state.notifications.map(n => `
+      <div class="p-4 rounded-xl border border-white/10 bg-white/5 flex gap-3">
+        <span data-lucide="${n.type === 'success' ? 'check-circle' : n.type === 'error' ? 'alert-circle' : n.type === 'alert' ? 'alert-triangle' : 'info'}" class="w-5 h-5 flex-shrink-0 ${n.type === 'success' ? 'text-emerald-500' : n.type === 'error' ? 'text-red-500' : n.type === 'alert' ? 'text-amber-500' : 'text-blue-500'}"></span>
+        <div class="space-y-1">
+           <p class="text-sm font-medium text-white">${n.message}</p>
+           <p class="text-[10px] text-gray-500">${new Date(n.timestamp).toLocaleString()}</p>
+        </div>
+      </div>
+    `).join('');
+  }
+
+  showModal('Notification History', content);
+}
+
+function renderNotifications() {
+  const container = document.createElement('div');
+  container.className = 'fixed top-4 right-4 z-[9999] flex flex-col items-end gap-3 pointer-events-none';
+  
+  state.notifications.forEach(n => {
+    const toast = document.createElement('div');
+    toast.className = `pointer-events-auto p-4 rounded-xl border flex items-center gap-3 backdrop-blur-md shadow-2xl animate-in slide-in-from-right-4 duration-300 w-80 
+      ${n.type === 'success' ? 'bg-emerald-950/80 border-emerald-500/30 text-emerald-100' : ''}
+      ${n.type === 'alert' ? 'bg-amber-950/80 border-amber-500/30 text-amber-100' : ''}
+      ${n.type === 'error' ? 'bg-red-950/80 border-red-500/30 text-red-100' : ''}
+      ${n.type === 'info' ? 'bg-navy-dark/80 border-white/10 text-white' : ''}`;
+    
+    toast.innerHTML = `
+      <span data-lucide="${n.type === 'success' ? 'check-circle' : n.type === 'error' ? 'alert-circle' : n.type === 'alert' ? 'alert-triangle' : 'info'}" class="w-5 h-5 flex-shrink-0"></span>
+      <p class="text-xs font-medium">${n.message}</p>
+    `;
+    container.appendChild(toast);
+  });
+  
+  appRoot.appendChild(container);
 }
 
 // --- RENDER LOGIC ---
@@ -401,17 +578,53 @@ function render() {
       content = renderLanding();
       break;
     case 'main':
-      content = renderMainPage();
+      content = state.currentGuild ? renderMainPage() : renderLanding();
+      if (!state.currentGuild) state.view = 'landing';
       break;
     case 'control':
-      content = renderControlRoom();
+      content = state.currentGuild ? renderControlRoom() : renderLanding();
+      if (!state.currentGuild) state.view = 'landing';
       break;
     default:
       content = renderLanding();
   }
 
   appRoot.appendChild(content);
+  // Debug Overlay
+  const debugOverlay = document.createElement('div');
+  debugOverlay.className = 'fixed bottom-4 right-4 z-[9999] flex flex-col items-end gap-2 pointer-events-none';
+  debugOverlay.innerHTML = `
+    <div id="debug-panel" class="hidden bg-black/90 border border-white/10 rounded-xl p-3 w-80 max-h-64 overflow-y-auto text-[10px] font-mono text-emerald-400 pointer-events-auto shadow-2xl">
+      <div class="flex items-center justify-between mb-2 border-b border-white/10 pb-1">
+        <span class="font-bold uppercase tracking-widest text-white/50">Debug Console</span>
+        <button id="btn-clear-debug" class="text-white/30 hover:text-white">Clear</button>
+      </div>
+      <div class="space-y-1">
+        ${debugLogs.length === 0 ? '<p class="text-white/20 italic">No logs yet...</p>' : debugLogs.join('<br>')}
+      </div>
+    </div>
+    <button id="btn-toggle-debug" class="bg-navy-dark border border-white/10 p-2 rounded-full text-white/30 hover:text-white pointer-events-auto">
+       <span data-lucide="terminal" class="w-4 h-4"></span>
+    </button>
+  `;
+  appRoot.appendChild(debugOverlay);
+  
+  const panel = debugOverlay.querySelector('#debug-panel')!;
+  debugOverlay.querySelector('#btn-toggle-debug')?.addEventListener('click', () => {
+    panel.classList.toggle('hidden');
+  });
+  debugOverlay.querySelector('#btn-clear-debug')?.addEventListener('click', () => {
+    debugLogs = [];
+    render();
+  });
+
   updateLucideIcons();
+  renderNotifications();
+  
+  // Custom: if on landing, help user see their ID
+  if (state.view === 'landing') {
+     console.log(`Current User ID: ${state.currentUser.id}`);
+  }
 }
 
 function renderLanding() {
@@ -443,11 +656,11 @@ function renderLanding() {
 
         <div class="space-y-3">
           <span class="label px-2">Joined Guilds</span>
-          ${state.guilds.length === 0 ? `
+          ${(state.guilds || []).length === 0 ? `
              <p class="text-sm text-center py-6 text-gray-600 italic">No guilds joined yet.</p>
           ` : `
              <div class="space-y-2">
-                ${state.guilds.map(g => {
+                ${(state.guilds || []).map(g => {
                   const isMember = (g.members || []).some(m => m.id === state.currentUser.id);
                   const isLeader = localStorage.getItem(`auth_key_${g.id}`) === g.leaderKey;
                   const isPending = (g.pendingApprovals || []).some(p => p.id === state.currentUser.id);
@@ -456,7 +669,7 @@ function renderLanding() {
                   return `
                   <button class="guild-item w-full flex items-center gap-3 p-3 glass-card hover:bg-white/5 disabled:opacity-50 disabled:cursor-wait transition-all text-left" data-guild-id="${g.id}" ${status === 'pending' ? 'disabled' : ''}>
                      <div class="w-8 h-8 bg-white/5 rounded-lg flex items-center justify-center">
-                        <span data-lucide="users" class="w-4 h-4 text-gray-400"></span>
+                        <span data-lucide="${g.public ? 'globe' : 'users'}" class="w-4 h-4 text-gray-400"></span>
                      </div>
                      <span class="flex-1 font-medium text-sm">${g.name}</span>
                      ${status === 'pending' ? `
@@ -472,9 +685,14 @@ function renderLanding() {
                 }).join('')}
              </div>
           `}
-          <button id="btn-join-code" class="w-full py-2 text-xs font-black uppercase tracking-[0.2em] text-gold hover:text-[#d4af37] transition-colors mt-2">
-             Have an invite code?
-          </button>
+          <div class="flex gap-2">
+            <button id="btn-join-code" class="flex-1 py-2 text-xs font-black uppercase tracking-[0.2em] text-gold hover:text-[#d4af37] transition-colors mt-2">
+               Invite Code
+            </button>
+            <button id="btn-public-directory" class="flex-1 py-2 text-xs font-black uppercase tracking-[0.2em] text-white hover:text-gold transition-colors mt-2 bg-white/5 rounded-lg">
+               Browse Public
+            </button>
+          </div>
         </div>
       </div>
       
@@ -490,6 +708,7 @@ function renderLanding() {
   div.querySelector('#btn-create-guild')?.addEventListener('click', () => showCreateGuildModal());
   div.querySelector('#btn-edit-user')?.addEventListener('click', () => showProfileModal());
   div.querySelector('#btn-join-code')?.addEventListener('click', () => showJoinByCodeModal());
+  div.querySelector('#btn-public-directory')?.addEventListener('click', () => showPublicDirectoryModal());
   
   div.querySelectorAll('.guild-item').forEach(el => {
     el.addEventListener('click', () => {
@@ -501,8 +720,43 @@ function renderLanding() {
   return div;
 }
 
+function showPublicDirectoryModal() {
+  const publicGuilds = state.guilds.filter(g => g.public);
+
+  const container = document.createElement('div');
+  container.className = 'space-y-4';
+  container.innerHTML = `
+    <div class="space-y-2">
+      ${(publicGuilds || []).length === 0 ? `
+         <p class="text-sm text-center py-6 text-gray-600 italic">No public guilds available.</p>
+      ` : `
+         <div class="space-y-2">
+            ${(publicGuilds || []).map(g => `
+              <div class="flex items-center justify-between p-3 glass-card bg-white/5">
+                <span class="font-medium text-sm">${g.name}</span>
+                <button class="join-public-guild btn btn-sm bg-gold/10 hover:bg-gold text-gold hover:text-navy-dark" data-guild-id="${g.id}">Join</button>
+              </div>
+            `).join('')}
+         </div>
+      `}
+    </div>
+  `;
+
+  const overlay = showModal('Public Guild Directory', container);
+  
+  container.querySelectorAll('.join-public-guild').forEach(el => {
+    el.addEventListener('click', () => {
+       const id = el.getAttribute('data-guild-id')!;
+       joinGuild(id);
+       overlay.remove();
+    });
+  });
+}
+
 function renderMainPage() {
-  const guild = state.currentGuild!;
+  const guild = state.currentGuild;
+  if (!guild) return renderLanding();
+  
   const main = document.createElement('div');
   main.className = 'flex flex-col h-screen';
   
@@ -515,14 +769,25 @@ function renderMainPage() {
         <div>
           <h2 class="text-xl font-bold tracking-tight">${guild.name}</h2>
           <div class="flex items-center gap-2 text-[10px] uppercase font-bold tracking-widest text-gray-500">
-             <span class="text-gold">${state.currentUser.role}</span>
+             <span class="text-gold">${state.currentUser.role === 'pending' ? 'Pending Approval' : state.currentUser.role}</span>
              <span>•</span>
-             <span>${state.timers.length} Timers</span>
+             <span>${(state.timers || []).length} Timers</span>
+             <span>•</span>
+             <span>${(guild.members || []).length} Members</span>
           </div>
         </div>
       </div>
 
       <div class="flex items-center gap-2">
+        <button id="btn-show-notifications" class="p-2 hover:bg-white/5 rounded-lg text-gray-400 hover:text-gold transition-colors" title="Notifications">
+          <span data-lucide="bell" class="w-4 h-4"></span>
+        </button>
+        <button id="btn-show-roster" class="p-2 hover:bg-white/5 rounded-lg text-gray-400 hover:text-gold transition-colors" title="Guild Roster">
+          <span data-lucide="users" class="w-4 h-4"></span>
+        </button>
+        <button id="btn-refresh-manual" class="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-white transition-colors" title="Sync with Server">
+          <span data-lucide="refresh-cw" class="w-4 h-4"></span>
+        </button>
         <button id="btn-toggle-profile" class="px-3 py-1.5 glass-card flex items-center gap-2 text-xs hover:bg-white/10 transition-colors">
            <span data-lucide="user-circle" class="w-4 h-4 text-gold"></span>
            <span class="hidden sm:inline">${state.currentUser.nickname}</span>
@@ -540,6 +805,14 @@ function renderMainPage() {
 
   main.querySelector('#btn-back-landing')?.addEventListener('click', () => leaveGuild());
   main.querySelector('#btn-toggle-profile')?.addEventListener('click', () => showProfileModal());
+  main.querySelector('#btn-show-roster')?.addEventListener('click', showRosterModal);
+  main.querySelector('#btn-show-notifications')?.addEventListener('click', () => showNotificationsModal());
+  main.querySelector('#btn-refresh-manual')?.addEventListener('click', () => {
+     if (state.currentGuild) {
+       joinGuild(state.currentGuild.id);
+       showAlert('Synced with server', 'Success');
+     }
+  });
   main.querySelector('#btn-go-control')?.addEventListener('click', () => {
     state.view = 'control';
     saveLocal();
@@ -556,7 +829,7 @@ function renderTimerGrid(_guild: Guild) {
   const container = document.createElement('div');
   container.className = 'px-4 max-w-7xl mx-auto space-y-12';
 
-  if (state.timers.length === 0) {
+  if ((state.timers || []).length === 0) {
     const empty = document.createElement('div');
     empty.className = 'flex flex-col items-center justify-center p-20 text-center text-gray-600';
     empty.innerHTML = `
@@ -578,7 +851,7 @@ function renderTimerGrid(_guild: Guild) {
            end.getTime() > now.getTime(); // Future events today
   }).sort((a, b) => (a.endTime || 0) - (b.endTime || 0));
 
-  if (upcomingToday.length > 0) {
+  if ((upcomingToday || []).length > 0) {
     const section = document.createElement('section');
     section.className = 'space-y-3 animate-in fade-in slide-in-from-top-4 duration-700 bg-gold/5 p-4 rounded-2xl border border-gold/10';
     section.innerHTML = `
@@ -587,10 +860,10 @@ function renderTimerGrid(_guild: Guild) {
            <span data-lucide="zap" class="w-3 h-3 text-gold"></span>
            <h3 class="text-[10px] font-black uppercase tracking-[0.2em] text-gold">Upcoming Today</h3>
         </div>
-        <span class="text-[10px] text-gold/60 font-mono">${upcomingToday.length} Event${upcomingToday.length > 1 ? 's' : ''} Remaining</span>
+        <span class="text-[10px] text-gold/60 font-mono">${(upcomingToday || []).length} Event${(upcomingToday || []).length > 1 ? 's' : ''} Remaining</span>
       </div>
       <div class="flex flex-wrap gap-x-6 gap-y-2">
-        ${upcomingToday.map(t => {
+        ${(upcomingToday || []).map(t => {
           const remaining = calculateRemaining(t);
           const timeStr = new Date(t.endTime!).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
           return `
@@ -625,7 +898,7 @@ function renderTimerGrid(_guild: Guild) {
     section.innerHTML = `
       <div class="flex items-center gap-3">
         <h3 class="text-xs font-black uppercase tracking-[0.2em] text-gray-500">${groupName}</h3>
-        <span class="px-1.5 py-0.5 rounded-full bg-white/5 text-[9px] font-bold text-gray-600">${groups[groupName].length}</span>
+        <span class="px-1.5 py-0.5 rounded-full bg-white/5 text-[9px] font-bold text-gray-600">${(groups[groupName] || []).length}</span>
       </div>
       <div class="subgroups-container space-y-6"></div>
     `;
@@ -634,7 +907,7 @@ function renderTimerGrid(_guild: Guild) {
     const fieldTimers = groups[groupName].filter(t => t.type === 'field');
     const scheduleTimers = groups[groupName].filter(t => t.type === 'schedule');
 
-    if (fieldTimers.length > 0) {
+    if ((fieldTimers || []).length > 0) {
       const fieldGrid = document.createElement('div');
       fieldGrid.className = 'p-6 rounded-3xl border border-white/5 bg-white/[0.02] space-y-4';
       fieldGrid.innerHTML = `
@@ -649,7 +922,7 @@ function renderTimerGrid(_guild: Guild) {
       subgroupContainer.appendChild(fieldGrid);
     }
 
-    if (scheduleTimers.length > 0) {
+    if ((scheduleTimers || []).length > 0) {
       const scheduleGrid = document.createElement('div');
       scheduleGrid.className = 'p-6 rounded-3xl border border-white/5 bg-white/[0.02] space-y-4';
       scheduleGrid.innerHTML = `
@@ -758,7 +1031,9 @@ function renderTimerCard(timer: Timer) {
 }
 
 function renderControlRoom() {
-  const guild = state.currentGuild!;
+  const guild = state.currentGuild;
+  if (!guild) return renderLanding();
+  
   const isLeader = state.currentUser.role === 'leader';
   
   const isAuthorized = state.currentUser.role === 'leader' || state.currentUser.role === 'officer';
@@ -802,8 +1077,8 @@ function renderControlRoom() {
               </div>
               
               <div class="space-y-2 max-h-96 overflow-y-auto pr-2">
-                 ${state.timers.length === 0 ? '<p class="text-xs text-gray-700 italic py-4">No timers found.</p>' : ''}
-                 ${state.timers.map(t => `
+                 ${(state.timers || []).length === 0 ? '<p class="text-xs text-gray-700 italic py-4">No timers found.</p>' : ''}
+                 ${(state.timers || []).map(t => `
                    <div class="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5 group">
                       <div class="flex items-center gap-3">
                          <div class="w-8 h-8 rounded-lg bg-white/5 flex items-center justify-center font-mono text-[10px] text-gray-500">${t.type[0].toUpperCase()}</div>
@@ -828,38 +1103,61 @@ function renderControlRoom() {
                 <p class="text-xs text-gray-500">Users authorized to manage timers.</p>
               </div>
               <div class="space-y-2">
-                 ${guild.officerIds.length === 0 ? '<p class="text-xs text-gray-600 italic">No officers appointed.</p>' : ''}
-                 ${guild.officerIds.map(oid => `
-                   <div class="flex items-center justify-between p-2 bg-white/5 rounded-lg">
-                      <span class="text-xs truncate max-w-[100px]">${oid}</span>
+                 ${(guild.officerIds || []).length === 0 ? '<p class="text-xs text-gray-600 italic">No officers appointed.</p>' : ''}
+                 ${(guild.officerIds || []).map(oid => {
+                   const member = (guild.members || []).find(m => m.id === oid);
+                   const name = member ? member.nickname : `User ${oid.slice(0, 4)}`;
+                   return `
+                   <div class="flex items-center justify-between p-2 bg-white/5 rounded-lg border border-white/5">
+                      <div class="flex items-center gap-2">
+                         <span data-lucide="shield" class="w-3 h-3 text-gold"></span>
+                         <span class="text-xs font-medium">${name}</span>
+                      </div>
                       ${isLeader ? `<button class="p-1 text-red-500/40 hover:text-red-500 remove-officer" data-id="${oid}"><span data-lucide="trash-2" class="w-3 h-3"></span></button>` : ''}
                    </div>
-                 `).join('')}
+                   `;
+                 }).join('')}
               </div>
               ${isLeader ? `
                 <button id="btn-add-officer" class="w-full py-2 border border-white/10 rounded-lg text-xs hover:bg-white/5 transition-colors">Appoint Officer</button>
               ` : ''}
-           </section>
-
-           <section class="glass-card p-6 flex flex-col gap-4">
+            </section>
+            
+            <section class="glass-card p-6 flex flex-col gap-6">
               <div>
-                <h3 class="text-lg font-bold">Members</h3>
-                <p class="text-xs text-gray-500">Manage guild access and population.</p>
+                <h3 class="text-lg font-bold">Guild Management Panel</h3>
+                <p class="text-xs text-gray-500">Member management, and roster control.</p>
               </div>
 
+              <!-- Approval Panel -->
               ${(guild.pendingApprovals?.length || 0) > 0 && isAuthorized ? `
-              <div class="space-y-3 p-4 bg-gold/5 rounded-2xl border border-gold/20">
-                 <p class="text-[10px] text-gold font-bold uppercase tracking-widest">Pending Approvals</p>
-                 <div class="space-y-2">
-                    ${guild.pendingApprovals.map(p => `
-                       <div class="flex items-center justify-between p-2 bg-white/5 rounded-lg border border-white/5">
-                          <div>
-                             <p class="text-xs font-bold text-white">${p.nickname}</p>
-                             <p class="text-[9px] text-gray-500 font-mono">${p.id.slice(0, 8)}...</p>
+              <div class="space-y-4 p-6 bg-black/20 rounded-3xl border border-white/10">
+                 <div class="flex items-center justify-between">
+                    <div>
+                        <h3 class="font-bold text-white flex items-center gap-2">
+                           <span data-lucide="shield-check" class="w-5 h-5 text-emerald-400"></span>
+                           Approval Queue
+                        </h3>
+                        <p class="text-xs text-gray-400">Manage incoming member requests.</p>
+                    </div>
+                    <span class="px-2 py-1 bg-emerald-500/10 text-emerald-400 rounded-lg text-[10px] font-bold uppercase tracking-wider">${(guild.pendingApprovals?.length || 0)} Pending</span>
+                 </div>
+                 
+                 <div class="space-y-3">
+                    ${(guild.pendingApprovals || []).map(p => `
+                       <div class="flex items-center justify-between p-4 bg-white/5 rounded-2xl border border-white/5 hover:border-white/10 transition-colors">
+                          <div class="flex items-center gap-3">
+                             <div class="w-10 h-10 rounded-full bg-white/10 flex items-center justify-center">
+                               <span data-lucide="user" class="w-5 h-5 text-gray-400"></span>
+                             </div>
+                             <div>
+                                <p class="text-sm font-bold text-white">${p.nickname}</p>
+                                <p class="text-xs text-gray-500 font-mono">${p.id.slice(0, 8)}...</p>
+                             </div>
                           </div>
-                          <div class="flex items-center gap-1">
-                             <button class="approve-member p-1.5 hover:bg-emerald-500/20 text-emerald-500 rounded" data-id="${p.id}"><span data-lucide="shield-check" class="w-3.5 h-3.5"></span></button>
-                             <button class="reject-member p-1.5 hover:bg-red-500/20 text-red-500 rounded" data-id="${p.id}"><span data-lucide="x" class="w-3.5 h-3.5"></span></button>
+                          <div class="flex items-center gap-2">
+                             <button class="approve-member px-4 py-2 bg-emerald-500 hover:bg-emerald-600 text-black text-xs font-bold rounded-xl transition-all" data-id="${p.id}">Accept</button>
+                             <button class="reject-member px-4 py-2 bg-white/5 hover:bg-white/10 text-white text-xs font-bold rounded-xl transition-all" data-id="${p.id}">Deny</button>
                           </div>
                        </div>
                     `).join('')}
@@ -867,33 +1165,50 @@ function renderControlRoom() {
               </div>
               ` : ''}
 
-              <div class="space-y-2 max-h-64 overflow-y-auto pr-2">
-                 ${(guild.members?.length || 0) === 0 ? '<p class="text-xs text-gray-600 italic">No members found.</p>' : ''}
-                 ${guild.members.map(m => {
-                    const isOfficer = guild.officerIds.includes(m.id);
-                    const isTheLeader = m.id === state.currentUser.id && state.currentUser.role === 'leader';
-                    
-                    // Permission logic for kicking
-                    // Leader can kick everyone (except themselves)
-                    // Officers can kick members (not officers/leaders)
-                    const canKick = isLeader ? (m.id !== state.currentUser.id) 
-                                             : (state.currentUser.role === 'officer' && !isOfficer && m.id !== state.currentUser.id);
-                    
-                    return `
-                    <div class="flex items-center justify-between p-2 bg-white/5 rounded-lg border border-white/5">
-                       <div class="flex items-center gap-2">
-                          <div class="w-6 h-6 rounded-full bg-gold/10 flex items-center justify-center">
-                             <span data-lucide="${isOfficer ? 'shield' : 'user-circle'}" class="w-3 h-3 ${isOfficer ? 'text-gold' : 'text-gray-500'}"></span>
+              <!-- Members -->
+              <div class="space-y-3">
+                  <p class="text-[10px] text-gray-500 font-bold uppercase tracking-widest flex items-center gap-2">
+                    <span data-lucide="users" class="w-3 h-3"></span>
+                    Current Roster (${(guild.members?.length || 0)})
+                  </p>
+                 <div class="space-y-2 max-h-64 overflow-y-auto pr-2 custom-scrollbar">
+                    ${(guild.members?.length || 0) === 0 ? '<p class="text-xs text-gray-600 italic">No members found.</p>' : ''}
+                    ${(guild.members || []).map(m => {
+                       const isOfficer = (guild.officerIds || []).includes(m.id);
+                       const canKick = isLeader ? (m.id !== state.currentUser.id) 
+                                                : (state.currentUser.role === 'officer' && !isOfficer && m.id !== state.currentUser.id);
+                       const isActualLeader = m.role === 'leader';
+                       const displayRoleVisible = isActualLeader ? 'Leader' : (isOfficer ? 'Officer' : 'Member');
+                       const formatJoinedDate = (dateStr: string) => {
+                         if (!dateStr) return 'Prior to Tracking';
+                         const d = new Date(dateStr);
+                         return isNaN(d.getTime()) ? 'Prior to Tracking' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+                       };
+                       const joinedDate = formatJoinedDate(m.joinedAt);
+                       
+                       return `
+                       <div class="member-card flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5 hover:border-white/10 transition-colors group cursor-pointer" data-id="${m.id}">
+                          <div class="flex items-center gap-3">
+                             <div class="w-8 h-8 rounded-full bg-white/5 flex items-center justify-center border border-white/5 shadow-inner">
+                                <span data-lucide="${isActualLeader ? 'crown' : (isOfficer ? 'shield' : 'user-circle')}" class="w-4 h-4 ${isActualLeader ? 'text-amber-400' : (isOfficer ? 'text-gold' : 'text-gray-500')}"></span>
+                             </div>
+                             <div>
+                                <div class="flex items-center gap-2">
+                                  <p class="text-xs font-medium text-white">${m.nickname}</p>
+                                  <span class="text-[7px] font-black uppercase ${isActualLeader ? 'text-amber-400 bg-amber-400/10' : (isOfficer ? 'text-gold bg-gold/10' : 'text-gray-500 bg-white/5')} px-1 rounded">${displayRoleVisible}</span>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                  <p class="text-[9px] text-gray-500 font-mono">${m.id.slice(0, 8)}</p>
+                                  <span class="text-[9px] text-gray-600">•</span>
+                                  <p class="text-[9px] text-gray-500 italic">Joined ${joinedDate}</p>
+                                </div>
+                             </div>
                           </div>
-                          <div>
-                             <p class="text-xs font-medium">${m.nickname}</p>
-                             <p class="text-[9px] text-gray-500 font-mono">${m.id.slice(0, 8)}...</p>
-                          </div>
+                          ${canKick ? `<button class="kick-member p-2 text-red-500/20 group-hover:text-red-500 hover:bg-red-500/10 rounded-lg transition-all" data-id="${m.id}" title="Kick Member"><span data-lucide="user-minus" class="w-3.5 h-3.5"></span></button>` : ''}
                        </div>
-                       ${canKick ? `<button class="p-1.5 text-red-500/40 hover:text-red-500 kick-member" data-id="${m.id}"><span data-lucide="log-out" class="w-3.5 h-3.5"></span></button>` : ''}
-                    </div>
-                    `;
-                 }).join('')}
+                       `;
+                    }).join('')}
+                 </div>
               </div>
            </section>
 
@@ -909,6 +1224,10 @@ function renderControlRoom() {
                     <button id="btn-edit-guild" class="w-full btn btn-secondary text-xs flex items-center justify-center gap-2">
                        <span data-lucide="settings" class="w-4 h-4"></span>
                        Guild Privacy & Sync
+                    </button>
+                    <button id="btn-show-invite-json" class="w-full btn btn-secondary text-xs flex items-center justify-center gap-2">
+                       <span data-lucide="share" class="w-4 h-4"></span>
+                       Generate Invite JSON
                     </button>
                     <div class="p-3 bg-white/5 rounded-xl border border-white/5 space-y-2">
                        <p class="text-[10px] font-bold uppercase text-gray-500 tracking-widest">Webhook Status</p>
@@ -949,18 +1268,44 @@ function renderControlRoom() {
     });
   });
 
+  div.querySelectorAll('.member-card').forEach(el => {
+      el.addEventListener('click', () => {
+         const id = el.getAttribute('data-id')!;
+         const member = (guild.members || []).find(m => m.id === id);
+         if (member) {
+            showMemberActionsModal(guild, member);
+         }
+      });
+   });
+
   // Member management events
   div.querySelectorAll('.approve-member').forEach(el => {
      el.addEventListener('click', () => {
         const id = el.getAttribute('data-id')!;
-        const pending = guild.pendingApprovals.find(p => p.id === id);
+        const pending = guild.pendingApprovals?.find(p => p.id === id);
         if (pending) {
-           if (!guild.members) guild.members = [];
-           guild.members.push(pending);
-           guild.pendingApprovals = guild.pendingApprovals.filter(p => p.id !== id);
-           storageManager.saveGuildData(guild);
-           notifyGuild(guild, `✅ **${pending.nickname}** has been approved and is now a member.`);
-           render();
+            console.log(`Approving member: ${pending.nickname} (${id})`);
+            // Set joined date to the actual approval date
+            const memberToJoin = { ...pending, joinedAt: new Date().toISOString() };
+            
+            if (guild.storageType === 'firebase') {
+               // Atomic updates for Firebase
+               storageManager.updateGuildPartial(guild.id, {
+                 members: StorageManager.arrayUnion(memberToJoin),
+                 pendingApprovals: StorageManager.arrayRemove(pending)
+               }, guild);
+               
+               // Instant UI feedback (optimistic)
+               guild.members = [...(guild.members || []), memberToJoin];
+               guild.pendingApprovals = (guild.pendingApprovals || []).filter(p => p.id !== id);
+            } else {
+               if (!guild.members) guild.members = [];
+               guild.members.push(memberToJoin);
+               guild.pendingApprovals = guild.pendingApprovals.filter(p => p.id !== id);
+               storageManager.saveGuildData(guild);
+            }
+            notifyGuild(guild, `✅ **${pending.nickname}** has been approved and is now a member.`);
+            render();
         }
      });
   });
@@ -974,30 +1319,62 @@ function renderControlRoom() {
         const pending = (guild.pendingApprovals || []).find(p => p.id === id);
         const name = member?.nickname || pending?.nickname || 'Unknown User';
 
+        console.log(`${isKick ? 'Kicking' : 'Rejecting'} user: ${name} (${id})`);
+
         if (isKick) {
-           guild.members = (guild.members || []).filter(m => m.id !== id);
-           guild.officerIds = (guild.officerIds || []).filter(oid => oid !== id);
+           if (guild.storageType === 'firebase') {
+             if (member) {
+               storageManager.updateGuildPartial(guild.id, {
+                 members: StorageManager.arrayRemove(member),
+                 officerIds: StorageManager.arrayRemove(id)
+               }, guild);
+               // Optimistic UI
+               guild.members = (guild.members || []).filter(m => m.id !== id);
+               guild.officerIds = (guild.officerIds || []).filter(oid => oid !== id);
+             }
+           } else {
+             guild.members = (guild.members || []).filter(m => m.id !== id);
+             guild.officerIds = (guild.officerIds || []).filter(oid => oid !== id);
+             storageManager.saveGuildData(guild);
+           }
            notifyGuild(guild, `🚪 **${name}** has been removed from the guild.`);
         } else {
-           guild.pendingApprovals = (guild.pendingApprovals || []).filter(p => p.id !== id);
+           if (guild.storageType === 'firebase') {
+             if (pending) {
+               storageManager.updateGuildPartial(guild.id, {
+                 pendingApprovals: StorageManager.arrayRemove(pending)
+               }, guild);
+               // Optimistic UI
+               guild.pendingApprovals = (guild.pendingApprovals || []).filter(p => p.id !== id);
+             }
+           } else {
+             guild.pendingApprovals = (guild.pendingApprovals || []).filter(p => p.id !== id);
+             storageManager.saveGuildData(guild);
+           }
            notifyGuild(guild, `❌ **${name}**'s join request was rejected.`);
         }
         
-        storageManager.saveGuildData(guild);
         render();
      });
   });
 
   if (isLeader) {
     div.querySelector('#btn-edit-guild')?.addEventListener('click', () => showEditGuildModal());
+    div.querySelector('#btn-show-invite-json')?.addEventListener('click', () => showInviteJsonModal(guild));
     div.querySelector('#btn-add-officer')?.addEventListener('click', () => {
        showAddOfficerModal(guild.id);
     });
     div.querySelectorAll('.remove-officer').forEach(el => {
        el.addEventListener('click', () => {
           const id = el.getAttribute('data-id')!;
-          guild.officerIds = guild.officerIds.filter(o => o !== id);
-          storageManager.saveGuildData(guild);
+          if (guild.storageType === 'firebase') {
+            storageManager.updateGuildPartial(guild.id, {
+               officerIds: StorageManager.arrayRemove(id)
+            }, guild);
+          } else {
+            guild.officerIds = guild.officerIds.filter(o => o !== id);
+            storageManager.saveGuildData(guild);
+          }
        });
     });
  } else {
@@ -1009,7 +1386,88 @@ function renderControlRoom() {
   return div;
 }
 
-// --- MODALS ---
+function showMemberActionsModal(guild: Guild, member: GuildMember) {
+  const overlay = document.createElement('div');
+  overlay.className = 'fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-md animate-in fade-in duration-300';
+  
+  const modal = document.createElement('div');
+  modal.className = 'bg-[#1a1d23] border border-white/10 w-full max-w-sm rounded-3xl shadow-2xl overflow-hidden animate-in zoom-in-95 duration-200';
+  
+  const isLeader = state.currentUser.role === 'leader';
+  const isOfficer = (guild.officerIds || []).includes(member.id);
+  const isSelf = member.id === state.currentUser.id;
+  const canKick = isLeader ? !isSelf : (state.currentUser.role === 'officer' && !isOfficer && !isSelf);
+  const canPromote = isLeader && !isOfficer && !isSelf;
+  const canDemote = isLeader && isOfficer && !isSelf;
+
+  modal.innerHTML = `
+    <div class="px-8 py-6 border-b border-white/5 flex items-center justify-between">
+      <h3 class="font-bold text-lg text-white">Member: ${member.nickname}</h3>
+      <button class="close-modal p-2 hover:bg-white/5 rounded-xl text-gray-500 transition-colors">
+        <span data-lucide="x" class="w-5 h-5"></span>
+      </button>
+    </div>
+    <div class="p-6 space-y-3">
+        ${canPromote ? `<button id="btn-promote" class="w-full btn btn-secondary text-xs">Promote to Officer</button>` : ''}
+        ${canDemote ? `<button id="btn-demote" class="w-full btn btn-secondary text-xs">Demote to Member</button>` : ''}
+        ${canKick ? `<button id="btn-kick" class="w-full btn bg-red-500/10 hover:bg-red-500/20 text-red-500 text-xs">Kick Member</button>` : ''}
+    </div>
+  `;
+
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  updateLucideIcons();
+
+  modal.querySelector('.close-modal')?.addEventListener('click', () => overlay.remove());
+
+  modal.querySelector('#btn-promote')?.addEventListener('click', () => {
+    if (guild.storageType === 'firebase') {
+        storageManager.updateGuildPartial(guild.id, {
+            officerIds: StorageManager.arrayUnion(member.id)
+        }, guild);
+    } else {
+        guild.officerIds.push(member.id);
+        storageManager.saveGuildData(guild);
+    }
+    overlay.remove();
+    render();
+  });
+
+  modal.querySelector('#btn-demote')?.addEventListener('click', () => {
+    if (guild.storageType === 'firebase') {
+        storageManager.updateGuildPartial(guild.id, {
+            officerIds: StorageManager.arrayRemove(member.id)
+        }, guild);
+    } else {
+        guild.officerIds = guild.officerIds.filter(id => id !== member.id);
+        storageManager.saveGuildData(guild);
+    }
+    overlay.remove();
+    render();
+  });
+
+  modal.querySelector('#btn-kick')?.addEventListener('click', () => {
+    if (confirm(`Kick ${member.nickname}?`)) {
+        // Kick logic from original renderControlRoom
+        if (guild.storageType === 'firebase') {
+           storageManager.updateGuildPartial(guild.id, {
+             members: StorageManager.arrayRemove(member),
+             officerIds: StorageManager.arrayRemove(member.id)
+           }, guild);
+           // Optimistic UI for firebase is slightly different, will let render re-sync
+        } else {
+           guild.members = (guild.members || []).filter(m => m.id !== member.id);
+           guild.officerIds = (guild.officerIds || []).filter(oid => oid !== member.id);
+           storageManager.saveGuildData(guild);
+        }
+        notifyGuild(guild, `🚪 **${member.nickname}** has been removed from the guild.`);
+        overlay.remove();
+        render();
+    }
+  });
+
+  return overlay;
+}
 
 function showModal(title: string, content: HTMLElement, onClose: () => void = () => {}) {
   const overlay = document.createElement('div');
@@ -1124,11 +1582,21 @@ function showProfileModal() {
      if (state.currentGuild) {
         const guildId = state.currentGuild.id;
         const nickname = state.currentUser.nickname;
+        const memberObj = (state.currentGuild.members || []).find(m => m.id === state.currentUser.id);
         
-        // Remove from remote members
-        state.currentGuild.members = (state.currentGuild.members || []).filter(m => m.id !== state.currentUser.id);
-        state.currentGuild.officerIds = (state.currentGuild.officerIds || []).filter(oid => oid !== state.currentUser.id);
-        storageManager.saveGuildData(state.currentGuild);
+        if (state.currentGuild.storageType === 'firebase') {
+           // Use partial updates to avoid overwriting other members
+           storageManager.updateGuildPartial(guildId, {
+              // We filter undefined in the adapter, but let's be clean here too
+              members: memberObj ? StorageManager.arrayRemove(memberObj) : (undefined as any),
+              officerIds: StorageManager.arrayRemove(state.currentUser.id)
+           }, state.currentGuild);
+        } else {
+           // Local storage can use full save
+           state.currentGuild.members = (state.currentGuild.members || []).filter(m => m.id !== state.currentUser.id);
+           state.currentGuild.officerIds = (state.currentGuild.officerIds || []).filter(oid => oid !== state.currentUser.id);
+           storageManager.saveGuildData(state.currentGuild);
+        }
         
         // Cleanup locally
         leaveGuild();
@@ -1205,29 +1673,103 @@ function showAlert(message: string, title: string = 'Alert') {
   div.querySelector('button')?.addEventListener('click', () => overlay.remove());
 }
 
+function showRosterModal() {
+  const guild = state.currentGuild;
+  if (!guild) return;
+
+  const rosterBody = document.createElement('div');
+  rosterBody.className = 'space-y-4';
+  
+  rosterBody.innerHTML = `
+    <div class="space-y-2 max-h-96 overflow-y-auto pr-2 custom-scrollbar">
+      ${(guild.members || []).map(m => {
+        const isOfficer = (guild.officerIds || []).includes(m.id);
+        const roleLabel = m.role === 'leader' ? 'Leader' : (isOfficer ? 'Officer' : 'Member');
+        const roleColor = m.role === 'leader' ? 'text-gold' : (isOfficer ? 'text-amber-400' : 'text-gray-400');
+        const roleBg = m.role === 'leader' ? 'bg-gold/10' : (isOfficer ? 'bg-amber-400/10' : 'bg-white/5');
+        const formatJoinedDate = (dateStr: string) => {
+          if (!dateStr) return 'Unknown';
+          const d = new Date(dateStr);
+          return isNaN(d.getTime()) ? 'Unknown' : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+        };
+        const joinedDate = formatJoinedDate(m.joinedAt);
+
+        return `
+          <div class="flex items-center justify-between p-4 bg-white/5 rounded-2xl border border-white/5">
+            <div class="flex items-center gap-3">
+              <div class="w-10 h-10 rounded-full bg-white/5 flex items-center justify-center border border-white/5">
+                <span data-lucide="${m.role === 'leader' ? 'crown' : (isOfficer ? 'shield' : 'user-circle')}" class="w-5 h-5 ${roleColor}"></span>
+              </div>
+              <div>
+                <div class="flex items-center gap-2">
+                  <p class="font-bold text-sm text-white">${m.nickname}</p>
+                  <span class="px-1.5 py-0.5 rounded ${roleBg} ${roleColor} text-[8px] font-black uppercase tracking-tighter">${roleLabel}</span>
+                </div>
+                <p class="text-[10px] text-gray-500 font-medium">Joined on ${joinedDate}</p>
+              </div>
+            </div>
+            <p class="text-[9px] font-mono text-gray-600">ID: ${m.id.slice(0, 6)}</p>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+
+  showModal('Guild Roster', rosterBody);
+}
+
 function showAddOfficerModal(guildId: string) {
   const guild = state.guilds.find(g => g.id === guildId);
   if (!guild) return;
 
   const form = document.createElement('form');
   form.className = 'space-y-4';
+  
+  // Render members list for selection
+  const memberListItems = (guild.members || []).map(m => `
+    <div class="flex items-center justify-between p-2 hover:bg-white/10 rounded member-row cursor-pointer select-none" data-id="${m.id}">
+      <span class="text-xs text-white">${m.nickname}</span>
+      <span class="text-[9px] text-gray-500 font-mono">${m.id.slice(0, 6)}...</span>
+    </div>
+  `).join('');
+
   form.innerHTML = `
     <div class="space-y-2">
-      <p class="text-sm text-gray-400">Enter the <span class="text-gold font-bold">User ID</span> of the member you want to appoint as an Officer.</p>
-      <input type="text" name="userId" class="input py-3" placeholder="Paste User ID here..." required autofocus>
+      <p class="text-xs text-gray-400">Select a member to copy their ID:</p>
+      <div class="border border-white/10 rounded-lg max-h-40 overflow-y-auto">
+        ${memberListItems || '<p class="text-xs text-gray-600 p-2 italic">No members found.</p>'}
+      </div>
+    </div>
+    <div class="space-y-2">
+      <input type="text" name="userId" class="input py-3" placeholder="Paste User ID here..." required>
       <p class="text-[10px] text-gray-500 italic font-mono">Tip: Members can find their ID in their Profile modal.</p>
     </div>
     <button type="submit" class="btn btn-primary w-full py-3 mt-2 font-bold tracking-widest uppercase text-xs">Appoint Officer</button>
   `;
+
+  // Add click handlers to populate input
+  form.querySelectorAll('.member-row').forEach(row => {
+    row.addEventListener('click', () => {
+      const id = row.getAttribute('data-id');
+      const input = form.querySelector('input[name="userId"]') as HTMLInputElement;
+      if (input && id) input.value = id;
+    });
+  });
 
   const overlay = showModal('Appoint Officer', form);
   form.onsubmit = (e) => {
     e.preventDefault();
     const data = new FormData(form);
     const id = (data.get('userId') as string).trim();
-    if (id && !guild.officerIds.includes(id)) {
-      guild.officerIds.push(id);
-      storageManager.saveGuildData(guild);
+    if (id && !(guild.officerIds || []).includes(id)) {
+      if (guild.storageType === 'firebase') {
+        storageManager.updateGuildPartial(guild.id, {
+          officerIds: StorageManager.arrayUnion(id)
+        }, guild);
+      } else {
+        guild.officerIds.push(id);
+        storageManager.saveGuildData(guild);
+      }
       overlay.remove();
       render();
     } else if (id) {
@@ -1285,7 +1827,7 @@ function showJoinByCodeModal() {
     const data = new FormData(form);
     try {
       const guild = JSON.parse(data.get('guildData') as string) as Guild;
-      if (guild.id && guild.name) {
+      if (guild && guild.id && guild.name) {
         updateLocalGuildRegistry(guild);
         overlay.remove();
         render();
@@ -1457,7 +1999,7 @@ function showTimerModal(existing?: Timer) {
 
       const list = typeConfig.querySelector('#schedule-list')!;
       const renderScheduleList = () => {
-        list.innerHTML = modalSchedules.length === 0 ? '<p class="text-[10px] text-gray-600 italic">No schedules defined.</p>' : '';
+        list.innerHTML = (modalSchedules || []).length === 0 ? '<p class="text-[10px] text-gray-600 italic">No schedules defined.</p>' : '';
         modalSchedules.forEach((s, idx) => {
           const row = document.createElement('div');
           row.className = 'flex gap-2 items-center animate-in slide-in-from-left-2 duration-200';
@@ -1562,18 +2104,27 @@ function showCreateGuildModal() {
            <input type="text" name="leaderKey" class="input" placeholder="For control access" required>
         </div>
      </div>
+     <div class="space-y-1">
+        <label class="label">Guild Visibility</label>
+        <div class="flex gap-4">
+           <label class="flex items-center gap-2 cursor-pointer">
+             <input type="checkbox" name="public" class="rounded border-white/10 bg-white/5 accent-gold">
+             <span class="text-xs text-gray-400">Public Directory</span>
+           </label>
+        </div>
+     </div>
      <div class="space-y-2 pt-4">
         <span class="label">Choose Initialization Type</span>
         <div class="grid grid-cols-2 gap-3">
            <label class="cursor-pointer">
-              <input type="radio" name="storageType" value="local" checked class="peer hidden">
+              <input type="radio" name="storageType" value="local" class="peer hidden">
               <div class="p-4 border border-white/10 rounded-2xl peer-checked:bg-gold/10 peer-checked:border-gold transition-all text-center">
                  <p class="text-sm font-bold">Local Only</p>
                  <p class="text-[10px] text-gray-500 mt-1">Individual storage</p>
               </div>
            </label>
            <label class="cursor-pointer">
-              <input type="radio" name="storageType" value="firebase" class="peer hidden">
+              <input type="radio" name="storageType" value="firebase" checked class="peer hidden">
               <div class="p-4 border border-white/10 rounded-2xl peer-checked:bg-amber-500/10 peer-checked:border-amber-500 transition-all text-center">
                  <p class="text-sm font-bold">Firebase Sync</p>
                  <p class="text-[10px] text-gray-500 mt-1">Real-time shared</p>
@@ -1581,7 +2132,7 @@ function showCreateGuildModal() {
            </label>
         </div>
      </div>
-     <div id="fb-config-area" class="hidden animate-in slide-in-from-top-2 space-y-3 p-4 bg-amber-500/5 border border-amber-500/10 rounded-2xl">
+     <div id="fb-config-area" class="animate-in slide-in-from-top-2 space-y-3 p-4 bg-amber-500/5 border border-amber-500/10 rounded-2xl">
         <p class="text-[10px] text-amber-500/50 font-bold uppercase">Firebase Realtime Database Config</p>
         <div class="grid grid-cols-2 gap-3">
            <div class="space-y-1">
@@ -1625,8 +2176,8 @@ function showCreateGuildModal() {
          databaseURL: data.get('fbDbUrl') as string,
          authDomain: data.get('fbAuthDomain') as string
        };
-       if (!fbConfig.apiKey || !fbConfig.projectId || !fbConfig.databaseURL) {
-         return showAlert('Please fill in all primary Firebase fields (API Key, Project ID, Database URL)', 'Validation Error');
+       if (!fbConfig.apiKey || !fbConfig.projectId) {
+         return showAlert('Please fill in all primary Firebase fields (API Key, Project ID)', 'Validation Error');
        }
     }
 
@@ -1637,14 +2188,18 @@ function showCreateGuildModal() {
       leaderKey: data.get('leaderKey') as string,
       storageType,
       firebaseConfig: fbConfig,
+      public: data.get('public') === 'on',
       officerIds: [],
-      members: [{ id: state.currentUser.id, nickname: state.currentUser.nickname, joinedAt: new Date().toISOString() }],
+      members: [{ id: state.currentUser.id, nickname: state.currentUser.nickname, role: 'leader', joinedAt: new Date().toISOString() }],
       pendingApprovals: []
     };
 
     localStorage.setItem(`auth_key_${guild.id}`, guild.leaderKey || '');
     state.guilds.push(guild);
     saveLocal();
+    if (storageType === 'firebase') {
+        storageManager.initializeGuild(guild);
+    }
     overlay.remove();
     joinGuild(guild.id, guild.memberPassword);
   };
@@ -1652,7 +2207,8 @@ function showCreateGuildModal() {
 
 function showEditGuildModal() {
   if (state.currentUser.role !== 'leader') return;
-  const guild = state.currentGuild!;
+  const guild = state.currentGuild;
+  if (!guild) return;
 
   const form = document.createElement('form');
   form.className = 'space-y-4';
@@ -1673,6 +2229,15 @@ function showEditGuildModal() {
      <div class="space-y-1">
         <label class="label">Member Join Pass (Update)</label>
         <input type="text" name="memberPassword" value="${guild.memberPassword || ''}" class="input text-xs">
+     </div>
+     <div class="space-y-1">
+        <label class="label">Guild Visibility</label>
+        <div class="flex gap-4">
+           <label class="flex items-center gap-2 cursor-pointer">
+             <input type="checkbox" name="public" ${guild.public ? 'checked' : ''} class="rounded border-white/10 bg-white/5 accent-gold">
+             <span class="text-xs text-gray-400">Public Directory</span>
+           </label>
+        </div>
      </div>
 
      <div class="space-y-2 pt-2">
@@ -1745,6 +2310,7 @@ function showEditGuildModal() {
       guild.leaderKey = data.get('leaderKey') as string;
       guild.memberPassword = data.get('memberPassword') as string;
       guild.storageType = newStorageType;
+      guild.public = data.get('public') === 'on';
 
       if (newStorageType === 'firebase') {
         guild.firebaseConfig = {
@@ -1756,13 +2322,19 @@ function showEditGuildModal() {
       }
       
       localStorage.setItem(`auth_key_${guild.id}`, guild.leaderKey || '');
-      storageManager.saveGuildData(guild);
       
-      // If storage type changed, we need to re-initialize the storage manager
-      if (newStorageType !== guild.storageType) {
-         // This is handled by joinGuild which calls storageManager.setGuild
+      if (guild.storageType === 'firebase') {
+         storageManager.updateGuildPartial(guild.id, {
+            webhookUrl: guild.webhookUrl,
+            leaderKey: guild.leaderKey,
+            memberPassword: guild.memberPassword,
+            public: guild.public,
+            firebaseConfig: guild.firebaseConfig
+         }, guild);
+      } else {
+         storageManager.saveGuildData(guild);
       }
-
+      
       overlay.remove();
       // Re-join to re-initialize storage with new config/type
       joinGuild(guild.id, guild.memberPassword); 
@@ -1770,7 +2342,46 @@ function showEditGuildModal() {
 }
 
 
-// --- APP START ---
+function showInviteJsonModal(guild: Guild) {
+  const inviteData = {
+    id: guild.id,
+    name: guild.name,
+    memberPassword: guild.memberPassword,
+    storageType: guild.storageType,
+    firebaseConfig: guild.firebaseConfig,
+    officerIds: guild.officerIds || [],
+    members: guild.members || [],
+    pendingApprovals: guild.pendingApprovals || []
+  };
+
+  const container = document.createElement('div');
+  container.className = 'space-y-4';
+  container.innerHTML = `
+    <p class="text-xs text-gray-500">Share this JSON with members you want to invite.</p>
+    <textarea id="invite-json-area" readonly class="w-full h-32 p-3 bg-white/5 border border-white/10 rounded-lg text-xs font-mono text-gray-300"></textarea>
+    <button id="btn-copy-json" class="w-full btn btn-primary text-xs">Copy to Clipboard</button>
+  `;
+  container.querySelector('#invite-json-area')!.textContent = JSON.stringify(inviteData, null, 2);
+  
+  const overlay = showModal('Invite JSON', container);
+  
+  container.querySelector('#btn-copy-json')?.addEventListener('click', () => {
+    navigator.clipboard.writeText(JSON.stringify(inviteData, null, 2));
+    const btn = container.querySelector('#btn-copy-json') as HTMLButtonElement;
+    btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = 'Copy to Clipboard', 2000);
+  });
+}
+
+function handleFirestoreError(error: unknown, operationType: string, path: string | null) {
+  const errInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
 
 function startLoop() {
   function uiTick() {
@@ -1795,7 +2406,6 @@ function startLoop() {
   }
   requestAnimationFrame(uiTick);
 }
-
 loadLocal();
 startLoop();
 render();

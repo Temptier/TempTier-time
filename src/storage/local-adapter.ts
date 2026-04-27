@@ -36,6 +36,10 @@ export class LocalStorageAdapter implements StorageAdapter {
     window.dispatchEvent(new Event('storage'));
   }
 
+  async initializeGuild(guild: Guild): Promise<void> {
+    await this.saveGuildData(guild);
+  }
+
   subscribeGuild(guildId: string, callback: (guild: Guild) => void): () => void {
     const handler = () => {
       const raw = localStorage.getItem(`guild_${guildId}`);

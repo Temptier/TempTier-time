@@ -10,5 +10,7 @@ export interface StorageAdapter {
   loadTimers(guildId: string): Promise<Timer[]>;
   subscribe(guildId: string, callback: (timers: Timer[]) => void): () => void;
   saveGuildData(guild: Guild): Promise<void>;
+  initializeGuild(guild: Guild): Promise<void>;
   subscribeGuild(guildId: string, callback: (guild: Guild) => void): () => void;
+  updateGuildPartial?(guildId: string, data: any): Promise<void>;
 }

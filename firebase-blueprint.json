@@ -1,0 +1,39 @@
+{
+  "entities": {
+    "Guild": {
+      "title": "Guild",
+      "description": "Represents a guild.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "storageType": { "type": "string" },
+        "officerIds": { "type": "array" },
+        "members": { "type": "array" },
+        "pendingApprovals": { "type": "array" }
+      },
+      "required": ["id", "name", "storageType"]
+    },
+    "Timer": {
+      "title": "Timer",
+      "description": "Represents a timer.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "guildId": { "type": "string" },
+        "name": { "type": "string" }
+      },
+      "required": ["id", "guildId", "name"]
+    }
+  },
+  "firestore": {
+    "/guilds/{guildId}": {
+      "schema": "Guild",
+      "description": "Guild data."
+    },
+    "/guilds/{guildId}/timers/{timerId}": {
+      "schema": "Timer",
+      "description": "Guild timers."
+    }
+  }
+}

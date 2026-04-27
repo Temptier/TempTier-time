@@ -6,7 +6,7 @@
 export type TimerType = 'field' | 'schedule' | 'repeat';
 export type TimerStatus = 'running' | 'paused' | 'finished';
 export type StorageType = 'local' | 'firebase';
-export type UserRole = 'leader' | 'officer' | 'member';
+export type UserRole = 'leader' | 'officer' | 'member' | 'visitor' | 'pending';
 
 export interface FirebaseConfig {
   apiKey: string;
@@ -18,6 +18,7 @@ export interface FirebaseConfig {
 export interface GuildMember {
   id: string;
   nickname: string;
+  role: UserRole;
   joinedAt: string;
 }
 
@@ -33,6 +34,8 @@ export interface Guild {
   members: GuildMember[]; // Approved members
   pendingApprovals: GuildMember[]; // Users waiting for approval
   timers?: Timer[];
+  public?: boolean; // Guild is visible in public directory
+  _unsynced?: boolean; // Internal UI flag to handle delayed Firebase sync
 }
 
 export interface UserProfile {
@@ -69,10 +72,18 @@ export interface Timer {
   lastThresholdNotifiedAt?: number;
 }
 
+export interface AppNotification {
+  id: string;
+  message: string;
+  type: 'info' | 'success' | 'alert' | 'error';
+  timestamp: number;
+}
+
 export interface AppState {
   guilds: Guild[]; // Local index of known guilds
   currentGuild: Guild | null;
   currentUser: UserProfile;
   view: 'landing' | 'main' | 'control';
   timers: Timer[];
+  notifications: AppNotification[];
 }
